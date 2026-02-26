@@ -1,0 +1,74 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# venv
+.venv/
+venv/
+env/
+ENV/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Env / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# =========================
+# Logs / Runtime
+# =========================
+*.log
+logs/
+tmp/
+temp/
+*.pid
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Docker / Compose
+# =========================
+docker-compose.override.yml
+**/.docker/
+**/Dockerfile.local
+
+# Docker volume data (Kafka/Postgres 등 로컬 데이터)
+data/
+volumes/
+postgres_data/
+pgdata/
+kafka_data/
+zookeeper_data/
+kafka-logs/
+kafka/
+zookeeper/
+pg_data/
+
+
