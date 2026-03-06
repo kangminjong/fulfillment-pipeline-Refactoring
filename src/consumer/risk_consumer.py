@@ -165,9 +165,21 @@ CRASH_AFTER_DB_COMMIT = os.getenv("CRASH_AFTER_DB_COMMIT", "false").lower() == "
 # 5. 핵심 로직 & 함수
 # =========================================================
 def parse_iso_datetime(value):
-    if not value: return datetime.now(timezone.utc)
-    if isinstance(value, datetime): return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if not value:
+        return datetime.now(timezone.utc)
+
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
 
 def send_slack_alert(cur, event_id, risk_reason, order_data):
     if not ENABLE_SLACK or not SLACK_WEBHOOK_URL:
@@ -254,14 +266,17 @@ if __name__ == "__main__":
     conn = psycopg2.connect(**DB_CONFIG)
     abuse_tracker = defaultdict(deque)
     product_tracker = defaultdict(deque)
-
+    
+    BOOTSTRAP_SERVER_LIST = [s.strip() for s in (BOOTSTRAP_SERVERS or "").split(",") if s.strip()]
+    
     consumer = KafkaConsumer(
         TOPIC_NAME, 
-        bootstrap_servers=[BOOTSTRAP_SERVERS], 
+        bootstrap_servers=BOOTSTRAP_SERVER_LIST, 
         group_id=GROUP_ID,
         auto_offset_reset='earliest',
         enable_auto_commit=False,
-        value_deserializer=lambda x: json.loads(x.decode("utf-8"))
+        value_deserializer=None,
+        consumer_timeout_ms=500,
     )
 
     print(f"[Consumer] Started. Monitoring: {TOPIC_NAME}")
@@ -280,179 +295,265 @@ if __name__ == "__main__":
         order_pre_rows = []
         event_rows = []
         
-        for message in consumer:
-           
-            order = message.value
-            is_empty_payload = (
-            not order
-            or (isinstance(order, dict) and set(order.keys()) <= {"run_id", "seq"})
-            )
-            if is_empty_payload:
+        FLUSH_INTERVAL_SEC = float(os.getenv("FLUSH_INTERVAL_SEC", "3"))
+        last_flush = time.time()
+        PENDING_FLUSH_INTERVAL_SEC = float(os.getenv("PENDING_FLUSH_INTERVAL_SEC", "3"))
+        last_pending_flush = time.time()
+        while True:
+            now = time.time()
+            for message in consumer:
                 try:
-                    run_id_for_log = order.get("run_id", "no_run_id") if isinstance(order, dict) else "no_run_id"
-                    with conn.cursor() as cur:
-                        cur.execute(SQL_INSERT_ERROR_LOG, (
-                        run_id_for_log, CODE_EMPTY_JSON, message.topic, message.partition, message.offset
-                        ))
-                    pending += 1
-                    processed += 1
+                    order = json.loads(message.value.decode("utf-8"))
+                except Exception:
+                    try:
+                        now = time.time()
+                        with conn.cursor() as cur:
+                            cur.execute(SQL_INSERT_ERROR_LOG, (
+                            "no_run_id", "BAD_JSON", message.topic, message.partition, message.offset
+                            ))
+                        pending += 1
+                        processed += 1
+                        if len(raw_rows) == 0 and pending > 0 and (
+                        pending >= BATCH_COMMIT or (now - last_pending_flush) >= PENDING_FLUSH_INTERVAL_SEC
+                        ):
+                            conn.commit()
+                            consumer.commit()
+                            pending = 0
+                            last_pending_flush = now
+                    except Exception:
+                        conn.rollback()
+                    continue
+                is_empty_payload = (
+                not order
+                or (isinstance(order, dict) and set(order.keys()) <= {"run_id", "seq"})
+                )
+                if is_empty_payload:
+                    try:
+                        run_id_for_log = order.get("run_id", "no_run_id") if isinstance(order, dict) else "no_run_id"
+                        with conn.cursor() as cur:
+                            cur.execute(SQL_INSERT_ERROR_LOG, (
+                            run_id_for_log, CODE_EMPTY_JSON, message.topic, message.partition, message.offset
+                            ))
+                        pending += 1
+                        processed += 1
+                        now = time.time()
+                        if len(raw_rows) == 0 and pending > 0 and (
+                            pending >= BATCH_COMMIT or (now - last_pending_flush) >= PENDING_FLUSH_INTERVAL_SEC
+                        ):
+                            conn.commit()
+                            consumer.commit()
+                            pending = 0
+                            last_pending_flush = now
+                        if CRASH_AFTER_DB_COMMIT:
+                            print("CRASH_AFTER_DB_COMMIT=TRUE -> 강제 종료", flush=True)
+                            os._exit(1)                
+                        if processed % LOG_EVERY == 0:
+                            dt = time.time() - t0
+                            print(f"[Consumer] processed={processed} eps={processed/dt:.1f}", flush=True)
+                    except Exception as e:
+                        conn.rollback()
+                        print(f"Error Logging Failed: {e}")         
+                    continue 
+                event_id = str(uuid.uuid5(
+                uuid.NAMESPACE_DNS,
+                f"{message.topic}_{message.partition}_{message.offset}"
+                ))
+                run_id = (order.get("run_id") or "no_run_id").strip()
                     
-                    if pending >= BATCH_COMMIT and len(raw_rows) == 0:
+                occurred_at = parse_iso_datetime(
+                order.get("occurred_at") or order.get("event_produced_at") or order.get("created_at")
+                )
+                    
+                ingested_at = datetime.now(timezone.utc)
+
+                try:
+                    flushed = False
+                    with conn.cursor() as cur:
+                        if SLEEP_MS > 0:
+                            time.sleep(SLEEP_MS / 1000.0)
+                        risk_reason = None if DISABLE_RISK else check_risk_and_stock(cur, order, abuse_tracker, product_tracker)
+                        current_status = "HOLD" if risk_reason else order.get('current_status', 'PAID')
+                        current_stage = order.get('current_stage', 'PAYMENT')
+                        
+                        t_prod = parse_iso_datetime(order.get('event_produced_at'))
+                        t_cre = parse_iso_datetime(order.get('created_at'))
+                        raw_rows.append((
+                            event_id,
+                            run_id, Json(order), order.get("order_id"),
+                            message.topic, message.partition, message.offset,
+                            ingested_at
+                        ))
+                        event_ids.append(event_id)
+                        # 3. Orders 테이블 저장
+                        
+                        t_prod = parse_iso_datetime(order.get('event_produced_at'))
+                        t_cre  = parse_iso_datetime(order.get('created_at'))
+
+                        lat_p_to_k = (ingested_at - t_prod).total_seconds()
+                        lat_p_to_d = (datetime.now(timezone.utc) - t_prod).total_seconds()
+                        # cur.execute(SQL_UPSERT_ORDER, (
+                        #     order.get('order_id'), order.get('user_id'), order.get('product_id'), 
+                        #     order.get('product_name'), order.get('shipping_address'), 
+                        #     current_stage, current_status, risk_reason, run_id,
+                        #     "ORDER_CREATED", occurred_at, raw_id, t_cre, t_prod, lat_p_to_k, lat_p_to_d
+                        # ))
+                        order_pre_rows.append((
+                            event_id,  # 나중에 raw_id 매핑 키
+                            order.get('order_id'), order.get('user_id'), order.get('product_id'),
+                            order.get('product_name'), order.get('shipping_address'),
+                            current_stage, current_status, risk_reason, run_id,
+                            "ORDER_CREATED", occurred_at,
+                            t_cre, t_prod, lat_p_to_k, lat_p_to_d
+                        ))
+                        
+                        event_rows.append((
+                            event_id, run_id, order.get('order_id'),
+                            "ORDER_CREATED", current_status, risk_reason,
+                            occurred_at, ingested_at
+                        ))
+                        # 4. Events 테이블 저장 (제공해주신 스키마 7개 컬럼에 맞춰 수정)
+                        # cur.execute(SQL_INSERT_EVENT, (
+                        #     event_id,                 # event_id
+                        #     run_id,
+                        #     order.get('order_id'),  # order_id
+                        #     "ORDER_CREATED",        # event_type
+                        #     current_status,         # current_status
+                        #     risk_reason,            # reason_code
+                        #     occurred_at,                  # occurred_at
+                        #     ingested_at                   # ingested_at
+                        # ))
+
+                        if risk_reason in [CODE_FRAUD_USER, CODE_FRAUD_PROD]:
+                            apply_quarantine(cur, risk_reason, order)
+
+                        if risk_reason and ENABLE_SLACK:
+                            send_slack_alert(cur, event_id, risk_reason, order)
+                        
+                    
+                        now = time.time()
+                        need_flush = (len(raw_rows) >= DB_BATCH_SIZE) or (
+                                (now - last_flush) >= FLUSH_INTERVAL_SEC and len(raw_rows) > 0
+                        )
+
+                        if need_flush:
+                            execute_values(cur, SQL_INSERT_RAW, raw_rows, page_size=min(DB_BATCH_SIZE, len(raw_rows)))
+                            cur.execute(SQL_SELECT_RAWID_BY_EVENTIDS, (event_ids,))
+                            raw_map = dict(cur.fetchall())
+                            latest_by_order = {}
+
+                            for r in order_pre_rows:
+                                eid = r[0]
+                                raw_id = raw_map.get(eid)
+                                if raw_id is None:
+                                    continue
+
+                                order_id = r[1]
+                                last_occ = r[11]  # occurred_at
+
+                                row = (
+                                    r[1], r[2], r[3], r[4], r[5],
+                                    r[6], r[7], r[8], r[9],
+                                    r[10], r[11], raw_id,
+                                    r[12], r[13], r[14], r[15]
+                                )
+
+                                prev = latest_by_order.get(order_id)
+                                if (prev is None) or (prev[0] <= last_occ):
+                                    latest_by_order[order_id] = (last_occ, row)
+
+                            final_orders = [v[1] for v in latest_by_order.values()]
+
+                            if final_orders:
+                                execute_values(cur, SQL_UPSERT_ORDER_BULK, final_orders, page_size=DB_BATCH_SIZE)
+
+                            if event_rows:
+                                execute_values(cur, SQL_INSERT_EVENT_BULK, event_rows, page_size=DB_BATCH_SIZE)
+
+                            flushed = True
+                    if flushed:
                         conn.commit()
                         consumer.commit()
-                        pending = 0
-                    if CRASH_AFTER_DB_COMMIT:
-                        print("CRASH_AFTER_DB_COMMIT=TRUE -> 강제 종료", flush=True)
-                        os._exit(1)                
+
+                        raw_rows.clear()
+                        event_ids.clear()
+                        order_pre_rows.clear()
+                        event_rows.clear()
+                        last_flush = time.time()
+                    processed += 1
+
+                    # if pending >= BATCH_COMMIT:
+                    #     conn.commit()
+                    #     consumer.commit()
+                    #     pending = 0
+
                     if processed % LOG_EVERY == 0:
                         dt = time.time() - t0
                         print(f"[Consumer] processed={processed} eps={processed/dt:.1f}", flush=True)
+
+                    if CRASH_AFTER_DB_COMMIT:
+                        print("CRASH_AFTER_DB_COMMIT=TRUE -> 강제 종료", flush=True)
+                        os._exit(1)
+                            
+                    if risk_reason:
+                        print(f"[BLOCK] {risk_reason} -> Order: {order.get('order_id')}")
+                    
                 except Exception as e:
                     conn.rollback()
-                    print(f"Error Logging Failed: {e}")         
-                continue 
-            event_id = str(uuid.uuid5(
-            uuid.NAMESPACE_DNS,
-            f"{message.topic}_{message.partition}_{message.offset}"
-            ))
-            run_id = (order.get("run_id") or "no_run_id").strip()
-                
-            occurred_at = parse_iso_datetime(
-            order.get("occurred_at") or order.get("event_produced_at") or order.get("created_at")
-            )
-                
-            ingested_at = datetime.now(timezone.utc)
+                    print(f"Processing Error: {e}")
+                now = time.time()
 
-            try:
-                flushed = False
-                with conn.cursor() as cur:
-                    if SLEEP_MS > 0:
-                        time.sleep(SLEEP_MS / 1000.0)
-                    risk_reason = None if DISABLE_RISK else check_risk_and_stock(cur, order, abuse_tracker, product_tracker)
-                    current_status = "HOLD" if risk_reason else order.get('current_status', 'PAID')
-                    current_stage = order.get('current_stage', 'PAYMENT')
-                    
-                    t_prod = parse_iso_datetime(order.get('event_produced_at'))
-                    t_cre = parse_iso_datetime(order.get('created_at'))
-                    raw_rows.append((
-                        event_id,
-                        run_id, Json(order), order.get("order_id"),
-                        message.topic, message.partition, message.offset,
-                        ingested_at
-                    ))
-                    event_ids.append(event_id)
-                    # 3. Orders 테이블 저장
-                    
-                    t_prod = parse_iso_datetime(order.get('event_produced_at'))
-                    t_cre  = parse_iso_datetime(order.get('created_at'))
-
-                    lat_p_to_k = (ingested_at - t_prod).total_seconds()
-                    lat_p_to_d = (datetime.now(timezone.utc) - t_prod).total_seconds()
-                    # cur.execute(SQL_UPSERT_ORDER, (
-                    #     order.get('order_id'), order.get('user_id'), order.get('product_id'), 
-                    #     order.get('product_name'), order.get('shipping_address'), 
-                    #     current_stage, current_status, risk_reason, run_id,
-                    #     "ORDER_CREATED", occurred_at, raw_id, t_cre, t_prod, lat_p_to_k, lat_p_to_d
-                    # ))
-                    order_pre_rows.append((
-                        event_id,  # 나중에 raw_id 매핑 키
-                        order.get('order_id'), order.get('user_id'), order.get('product_id'),
-                        order.get('product_name'), order.get('shipping_address'),
-                        current_stage, current_status, risk_reason, run_id,
-                        "ORDER_CREATED", occurred_at,
-                        t_cre, t_prod, lat_p_to_k, lat_p_to_d
-                    ))
-                    
-                    event_rows.append((
-                        event_id, run_id, order.get('order_id'),
-                        "ORDER_CREATED", current_status, risk_reason,
-                        occurred_at, ingested_at
-                    ))
-                    # 4. Events 테이블 저장 (제공해주신 스키마 7개 컬럼에 맞춰 수정)
-                    # cur.execute(SQL_INSERT_EVENT, (
-                    #     event_id,                 # event_id
-                    #     run_id,
-                    #     order.get('order_id'),  # order_id
-                    #     "ORDER_CREATED",        # event_type
-                    #     current_status,         # current_status
-                    #     risk_reason,            # reason_code
-                    #     occurred_at,                  # occurred_at
-                    #     ingested_at                   # ingested_at
-                    # ))
-
-                    if risk_reason in [CODE_FRAUD_USER, CODE_FRAUD_PROD]:
-                        apply_quarantine(cur, risk_reason, order)
-
-                    if risk_reason and ENABLE_SLACK:
-                        send_slack_alert(cur, event_id, risk_reason, order)
-                    
-
-                    # ✅ 배치 크기 도달 시 3테이블 한 번에 flush
-                    if len(raw_rows) >= DB_BATCH_SIZE:
-                        execute_values(cur, SQL_INSERT_RAW, raw_rows, page_size=DB_BATCH_SIZE)
+            # 1) raw_rows 남아있으면 idle에서도 flush
+            if raw_rows and (now - last_flush) >= FLUSH_INTERVAL_SEC:
+                try:
+                    with conn.cursor() as cur:
+                        execute_values(cur, SQL_INSERT_RAW, raw_rows, page_size=min(DB_BATCH_SIZE, len(raw_rows)))
                         cur.execute(SQL_SELECT_RAWID_BY_EVENTIDS, (event_ids,))
                         raw_map = dict(cur.fetchall())
-                        latest_by_order = {}
 
+                        latest_by_order = {}
                         for r in order_pre_rows:
-                            eid = r[0]
-                            raw_id = raw_map.get(eid)
+                            raw_id = raw_map.get(r[0])
                             if raw_id is None:
                                 continue
-
                             order_id = r[1]
-                            last_occ = r[11]  # occurred_at
-
+                            last_occ = r[11]
                             row = (
                                 r[1], r[2], r[3], r[4], r[5],
                                 r[6], r[7], r[8], r[9],
                                 r[10], r[11], raw_id,
                                 r[12], r[13], r[14], r[15]
                             )
-
                             prev = latest_by_order.get(order_id)
                             if (prev is None) or (prev[0] <= last_occ):
                                 latest_by_order[order_id] = (last_occ, row)
 
                         final_orders = [v[1] for v in latest_by_order.values()]
-
                         if final_orders:
                             execute_values(cur, SQL_UPSERT_ORDER_BULK, final_orders, page_size=DB_BATCH_SIZE)
-
                         if event_rows:
                             execute_values(cur, SQL_INSERT_EVENT_BULK, event_rows, page_size=DB_BATCH_SIZE)
 
-                        flushed = True
-                if flushed:
                     conn.commit()
                     consumer.commit()
 
-                    raw_rows.clear()
-                    event_ids.clear()
-                    order_pre_rows.clear()
-                    event_rows.clear()
-                pending += 1
-                processed += 1
+                    raw_rows.clear(); event_ids.clear(); order_pre_rows.clear(); event_rows.clear()
+                    last_flush = time.time()
+                except Exception as e:
+                    conn.rollback()
+                    print(f"Idle Flush Error: {e}")
 
-                # if pending >= BATCH_COMMIT:
-                #     conn.commit()
-                #     consumer.commit()
-                #     pending = 0
-
-                if processed % LOG_EVERY == 0:
-                    dt = time.time() - t0
-                    print(f"[Consumer] processed={processed} eps={processed/dt:.1f}", flush=True)
-
-                if CRASH_AFTER_DB_COMMIT:
-                    print("CRASH_AFTER_DB_COMMIT=TRUE -> 강제 종료", flush=True)
-                    os._exit(1)
-                        
-                if risk_reason:
-                    print(f"[BLOCK] {risk_reason} -> Order: {order.get('order_id')}")
-
-            except Exception as e:
-                conn.rollback()
-                print(f"Processing Error: {e}")
+            # 2) pending만 쌓인 경우도 idle에서 commit
+            if pending > 0 and len(raw_rows) == 0 and (
+                pending >= BATCH_COMMIT or (now - last_pending_flush) >= PENDING_FLUSH_INTERVAL_SEC
+            ):
+                try:
+                    conn.commit()
+                    consumer.commit()
+                    pending = 0
+                    last_pending_flush = now
+                except Exception as e:
+                    conn.rollback()
+                    print(f"Pending Commit Error: {e}") 
 
     except KeyboardInterrupt:
         print("Consumer Stopped")
